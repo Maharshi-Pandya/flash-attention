@@ -481,6 +481,62 @@ def test_flash_attn_small_head_dim(seqlen_q, seqlen_k, d, causal, dtype):
     ).abs().max().item() + fwd_atol
 
 
+def _make_noncontig(ref):
+    # Same values as `ref` (b, s, h, d) but memory laid out as (b, h, s, d), so the
+    # logical (b, s, h, d) view has non-trivial s/h strides while head_dim stays
+    # contiguous (stride(-1) == 1). This is the transposed-bshd layout that the fwd
+    # must read via real strides; interface.maybe_contiguous leaves it as-is since
+    # stride(-1) == 1, so the non-contiguous tensor reaches the kernel. See commit
+    # "handle transposed bshd layout for hdim256 fwd".
+    out = ref.detach().transpose(1, 2).contiguous().transpose(1, 2)
+    assert not out.is_contiguous() and out.stride(-1) == 1
+    return out.requires_grad_(ref.requires_grad)
+
+
+# Forward with non-contiguous (transposed-bshd) q/k/v across all supported hdims and
+# attention flavours (dense/causal/local x mha/mqa/gqa).
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("mask", ["none", "causal", "local"])
+@pytest.mark.parametrize("d", [64, 96, 128, 192, 256])
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(128, 128), (256, 512), (384, 256)])
+@retry_on_oom
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_output_noncontiguous(seqlen_q, seqlen_k, d, mask, mha_type, dtype):
+    causal = mask == "causal"
+    local = mask == "local"
+    # SM100 hd256 2CTA kernel does not support local attention yet (see test_flash_attn_output).
+    if d == 256 and IS_SM100 and local:
+        pytest.skip("SM100 head_dim=256 2CTA kernel does not support local attention yet")
+    device = "cuda"
+    random.seed(0)
+    torch.random.manual_seed(0)
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    batch_size = 2
+    nheads = 6
+    nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
+    window_size = (seqlen_k // 4, seqlen_k // 4) if local else (None, None)
+
+    q_ref = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype).requires_grad_()
+    k_ref = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype).requires_grad_()
+    v_ref = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype).requires_grad_()
+    q, k, v = [_make_noncontig(x) for x in (q_ref, k_ref, v_ref)]
+
+    out_ref, _ = attention_ref(q_ref, k_ref, v_ref, None, None, causal=causal, window_size=window_size)
+    out_pt, _ = attention_ref(
+        q_ref, k_ref, v_ref, None, None, causal=causal, window_size=window_size,
+        upcast=False, reorder_ops=True,
+    )
+    out, _ = flash_attn_func(q, k, v, causal=causal, window_size=window_size)
+    if is_fake_mode():
+        return
+    fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
+    assert (out - out_ref).abs().max().item() <= 2 * (
+        out_pt - out_ref
+    ).abs().max().item() + fwd_atol
+
+
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])

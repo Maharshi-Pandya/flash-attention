@@ -33,6 +33,50 @@ from flash_attn.cute.utils import ex2_emulation_2
 from flash_attn.cute.utils import AuxData
 
 
+def _as_sdhb_tensor(
+    tensor: cute.Tensor,
+    s_total,
+    d,
+    h_r: Int32,
+    h_k: Int32,
+    b: Int32,
+    varlen: bool,
+    *,
+    broadcast_hr: bool,
+    d_major: bool,
+) -> cute.Tensor:
+    """Rebuild the fwd (s, d, ((h_r, h_k), b)) gmem view (d-major if d_major) from real strides.
+
+    broadcast_hr=True gives h_r stride 0 (GQA K/V read-broadcast); varlen drops batch to stride 0.
+    """
+    rank = cute.rank(tensor.layout)
+    if cutlass.const_expr(rank == 5):  # (b, s, h_k, h_r, d)
+        ss, sh = tensor.stride[1], tensor.stride[3]
+    elif cutlass.const_expr(rank == 4):  # (b, s, h, d)
+        ss, sh = tensor.stride[1], tensor.stride[2]
+    else:  # (total, h, d) varlen
+        assert cutlass.const_expr(rank == 3), "hd256 fwd expects rank 3, 4, or 5"
+        ss, sh = tensor.stride[0], tensor.stride[1]
+    divby = 128 // tensor.element_type.width  # 128-bit TMA alignment hint
+    ss64 = cute.assume(Int64(ss), divby=divby)
+    sh64 = cute.assume(Int64(sh), divby=divby)
+    sb64 = (
+        Int64(0)
+        if cutlass.const_expr(varlen)
+        else cute.assume(Int64(tensor.stride[0]), divby=divby)
+    )
+    head_mode = (
+        ((Int64(0), sh64), sb64)
+        if cutlass.const_expr(broadcast_hr)
+        else ((sh64, sh64 * Int64(h_r)), sb64)
+    )
+    if cutlass.const_expr(d_major):
+        layout = cute.make_layout((d, s_total, ((h_r, h_k), b)), stride=(1, ss64, head_mode))
+    else:
+        layout = cute.make_layout((s_total, d, ((h_r, h_k), b)), stride=(ss64, 1, head_mode))
+    return cute.make_tensor(tensor.iterator, layout)
+
+
 class BlackwellFusedMultiHeadAttentionForward:
     def __init__(
         self,
@@ -293,17 +337,21 @@ class BlackwellFusedMultiHeadAttentionForward:
             if cum_seqlen_k is not None and k_rank == 5
             else (k_tensor.shape[0] if cum_seqlen_k is not None else s_k64)
         )
-        stride_b_qo = h_r64 * h_k64 * s_q64 * d64 if cum_seqlen_q is None else 0
-        stride_b_kv = h_k64 * s_k64 * d64 if cum_seqlen_k is None else 0
         b_lse = b64 if cum_seqlen_q is None else 1
         stride_b_lse = h_r64 * h_k64 * s_lse64 if cum_seqlen_q is None else 0
 
-        # (s, d, ((h_r, h_k), b))
-        q_layout = cute.make_layout(
-            (s_q_total, d, ((h_r, h_k), b)),
-            stride=(d64 * h_r64 * h_k64, 1, ((d64, d64 * h_r64), stride_b_qo)),
+        # (s, d, ((h_r, h_k), b)) built from real strides; see _as_sdhb_tensor.
+        q = _as_sdhb_tensor(
+            q_tensor,
+            s_q_total,
+            d,
+            h_r,
+            h_k,
+            b,
+            cum_seqlen_q is not None,
+            broadcast_hr=False,
+            d_major=False,
         )
-        q = cute.make_tensor(q_tensor.iterator, q_layout)
         if cutlass.const_expr(mPageTable is not None):
             # Paged: K layout (num_pages, page_size, h_k, d); page_table maps kv_coord→physical page.
             num_pages = k_tensor.shape[0]
@@ -326,26 +374,43 @@ class BlackwellFusedMultiHeadAttentionForward:
             )
             page_table = cute.make_tensor(mPageTable.iterator, page_table_layout)
         else:
-            # (s, d, ((h_r, h_k), b)), 0-stride for h_r to broadcast
-            k_layout = cute.make_layout(
-                (s_k_total, d, ((h_r, h_k), b)),
-                stride=(d64 * h_k64, 1, ((0, d64), stride_b_kv)),
+            # (s, d, ((h_r, h_k), b)) and (d, s, ((h_r, h_k), b)); h_r broadcast for GQA.
+            k = _as_sdhb_tensor(
+                k_tensor,
+                s_k_total,
+                d,
+                h_r,
+                h_k,
+                b,
+                cum_seqlen_k is not None,
+                broadcast_hr=True,
+                d_major=False,
             )
-            k = cute.make_tensor(k_tensor.iterator, k_layout)
-            # (d, s, ((h_r, h_k), b)), 0-stride for h_r to broadcast
-            v_layout = cute.make_layout(
-                (d, s_k_total, ((h_r, h_k), b)),
-                stride=(1, d64 * h_k64, ((0, d64), stride_b_kv)),
+            v = _as_sdhb_tensor(
+                v_tensor,
+                s_k_total,
+                d,
+                h_r,
+                h_k,
+                b,
+                cum_seqlen_k is not None,
+                broadcast_hr=True,
+                d_major=True,
             )
-            v = cute.make_tensor(v_tensor.iterator, v_layout)
             page_table = None
             max_seqlen_k_paged = None
         # (s, d, ((h_r, h_k), b))
-        o_layout = cute.make_layout(
-            (s_q_total, d, ((h_r, h_k), b)),
-            stride=(d64 * h_r64 * h_k64, 1, ((d64, d64 * h_r64), stride_b_qo)),
+        o = _as_sdhb_tensor(
+            o_tensor,
+            s_q_total,
+            d,
+            h_r,
+            h_k,
+            b,
+            cum_seqlen_q is not None,
+            broadcast_hr=False,
+            d_major=False,
         )
-        o = cute.make_tensor(o_tensor.iterator, o_layout)
         if cutlass.const_expr(lse_tensor is not None):
             # (s, ((h_r, h_k), b))
             lse_layout = cute.make_layout(

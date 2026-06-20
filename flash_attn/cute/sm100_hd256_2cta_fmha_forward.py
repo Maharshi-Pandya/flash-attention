@@ -323,7 +323,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         s_q64 = Int64(s_q)
         s_k64 = Int64(s_k)
         s_lse64 = Int64(s_lse)
-        d64 = cute.assume(Int64(d), divby=128)
         h_r64 = Int64(h_r)
         h_k64 = Int64(h_k)
         b64 = Int64(b)
@@ -356,16 +355,30 @@ class BlackwellFusedMultiHeadAttentionForward:
             # Paged: K layout (num_pages, page_size, h_k, d); page_table maps kv_coord→physical page.
             num_pages = k_tensor.shape[0]
             page_size = k_tensor.shape[1]
-            page_size64 = Int64(page_size)
             max_seqlen_k_paged = Int32(mPageTable.shape[1] * page_size)
+            # Build paged K/V from the tensor's REAL strides (paged shape is
+            # (num_pages, page_size, h_k, d)) rather than assuming a packed
+            # contiguous layout, so non-contiguous paged K/V work. head_dim must
+            # stay contiguous (stride(-1) == 1); only the outer dims are flexible.
+            divby = 128 // k_tensor.element_type.width  # 128-bit TMA alignment hint
             k_paged_layout = cute.make_layout(
                 (page_size, d, h_k, num_pages),
-                stride=(d64 * h_k64, 1, d64, page_size64 * d64 * h_k64),
+                stride=(
+                    cute.assume(Int64(k_tensor.stride[1]), divby=divby),  # page_size
+                    1,  # d (contiguous)
+                    cute.assume(Int64(k_tensor.stride[2]), divby=divby),  # h_k
+                    cute.assume(Int64(k_tensor.stride[0]), divby=divby),  # num_pages
+                ),
             )
             k = cute.make_tensor(k_tensor.iterator, k_paged_layout)
             v_paged_layout = cute.make_layout(
                 (d, page_size, h_k, num_pages),
-                stride=(1, d64 * h_k64, d64, page_size64 * d64 * h_k64),
+                stride=(
+                    1,  # d (contiguous)
+                    cute.assume(Int64(v_tensor.stride[1]), divby=divby),  # page_size
+                    cute.assume(Int64(v_tensor.stride[2]), divby=divby),  # h_k
+                    cute.assume(Int64(v_tensor.stride[0]), divby=divby),  # num_pages
+                ),
             )
             v = cute.make_tensor(v_tensor.iterator, v_paged_layout)
             page_table_layout = cute.make_layout(

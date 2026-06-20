@@ -489,7 +489,12 @@ def _make_noncontig(ref):
     # stride(-1) == 1, so the non-contiguous tensor reaches the kernel. See commit
     # "handle transposed bshd layout for hdim256 fwd".
     out = ref.detach().transpose(1, 2).contiguous().transpose(1, 2)
-    assert not out.is_contiguous() and out.stride(-1) == 1
+    # A size-1 head dim (mqa: nheads_kv==1) can't be made non-contiguous by
+    # transposing it -- its stride is ignored by is_contiguous -- so the result
+    # is legitimately contiguous there. Only assert non-contiguity for >1 head.
+    if ref.shape[2] > 1:
+        assert not out.is_contiguous()
+    assert out.stride(-1) == 1
     return out.requires_grad_(ref.requires_grad)
 
 
